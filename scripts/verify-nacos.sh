@@ -78,13 +78,9 @@ get_config() {
         sleep 1
     done
     assert_status 200 "$description"
-    jq -e --arg data_id "$DATA_ID" --arg group "$GROUP" --arg content "$expected_content" '
-        type == "object" and .code == 0
-        and (.data | type == "object")
-        and .data.dataId == $data_id
-        and .data.group == $group
-        and .data.content == $content
-    ' "$HTTP_BODY" >/dev/null || fail "$description: returned configuration does not exactly match."
+    jq -e --arg content "$expected_content" '
+        type == "object" and .code == 0 and .data == $content
+    ' "$HTTP_BODY" >/dev/null || fail "$description: returned configuration content does not exactly match."
 }
 
 get_deleted_config() {
