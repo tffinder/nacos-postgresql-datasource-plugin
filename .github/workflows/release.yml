@@ -1,0 +1,353 @@
+name: Test, release, and verify Nacos PostgreSQL plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create (must start with v)'
+        required: true
+        default: v2.5.5.1
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  NACOS_VERSION: '2.5.5'
+  ARTIFACT_NAME: nacos-postgresql-datasource-plugin-ext-2.5.5.1-all.jar
+  SCHEMA_NAME: nacos-pg.sql
+  SCHEMA_PATH: nacos-postgresql-datasource-plugin-ext/src/main/resources/schema/nacos-pg.sql
+
+jobs:
+  test-and-build:
+    name: Build, end-to-end test, and release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: nacos-postgresql-release-${{ github.event.inputs.tag || github.ref_name }}
+      cancel-in-progress: false
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nacos
+          POSTGRES_PASSWORD: nacos
+          POSTGRES_DB: nacos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U nacos -d nacos"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+          --health-start-period=10s
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Resolve and validate release tag
+        id: release
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_TAG" =~ ^v[0-9A-Za-z._-]+$ ]]; then
+            printf 'Invalid release tag: %s\n' "$REQUESTED_TAG" >&2
+            exit 1
+          fi
+          printf 'tag=%s\n' "$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Install JSON assertion tool
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends jq postgresql-client
+
+      - name: Run Maven unit and integration tests
+        # The Java tests use zonky embedded-postgres, not the service container.
+        run: mvn -B -ntp clean verify
+
+      - name: Initialize PostgreSQL 16 for Nacos
+        env:
+          PGPASSWORD: nacos
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -p 5432 -U nacos -d nacos -v ON_ERROR_STOP=1 \
+            --file "$SCHEMA_PATH"
+
+      - name: Download official Nacos and start it with the built plugin
+        env:
+          # Public alibaba/nacos asset; authentication avoids API rate limits.
+          GH_TOKEN: ${{ github.token }}
+          NACOS_DB_URL: jdbc:postgresql://127.0.0.1:5432/nacos
+          NACOS_DB_USER: nacos
+          NACOS_DB_PASSWORD: nacos
+          VERIFY_WORK_ROOT: ${{ runner.temp }}/nacos-built
+          VERIFY_ARTIFACT_START_ONLY: 'true'
+          NACOS_HOME: ${{ runner.temp }}/nacos-built/nacos-server/nacos
+        run: |
+          set -euo pipefail
+          test -s "nacos-postgresql-datasource-plugin-ext/target/$ARTIFACT_NAME"
+          bash scripts/verify-artifact.sh \
+            "$GITHUB_WORKSPACE/nacos-postgresql-datasource-plugin-ext/target/$ARTIFACT_NAME"
+
+      - name: Verify built artifact through Nacos CRUD and history
+        env:
+          NACOS_HOME: ${{ runner.temp }}/nacos-built/nacos-server/nacos
+          VERIFY_TEST_ID: built-${{ steps.release.outputs.tag }}
+          VERIFY_READY_TIMEOUT: '180'
+        run: bash scripts/verify-nacos.sh
+
+      - name: Stop first Nacos instance
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f "$RUNNER_TEMP/nacos-built/nacos-server/nacos/bin/shutdown.sh" ]]; then
+            bash "$RUNNER_TEMP/nacos-built/nacos-server/nacos/bin/shutdown.sh" || true
+          fi
+
+      - name: Assemble release assets and verification notes
+        if: success()
+        run: |
+          set -euo pipefail
+          test -s "nacos-postgresql-datasource-plugin-ext/target/$ARTIFACT_NAME"
+          test -s "$SCHEMA_PATH"
+          mkdir -p release-assets
+          cp "nacos-postgresql-datasource-plugin-ext/target/$ARTIFACT_NAME" release-assets/
+          cp "$SCHEMA_PATH" "release-assets/$SCHEMA_NAME"
+          {
+            printf 'Nacos PostgreSQL datasource plugin %s\n\n' "${{ steps.release.outputs.tag }}"
+            printf 'Build and initial end-to-end verification\n'
+            printf -- '- Java: Temurin 17; Maven: clean verify (zonky embedded PostgreSQL).\n'
+            printf -- '- Nacos: official alibaba/nacos %s release, standalone mode.\n' "$NACOS_VERSION"
+            printf -- '- Database: PostgreSQL 16; schema initialized from %s.\n' "$SCHEMA_NAME"
+            printf -- '- Plugin: %s loaded from the Nacos plugins directory.\n' "$ARTIFACT_NAME"
+            printf -- '- API: v2 formal publish/get/update/delete and beta gray publish/get/delete.\n'
+            printf -- '- History: v1 accurate search, I/U/D rows, formal/gray publishType, grayName, extInfo.\n'
+            printf -- '- Logs: MapperManager/PostgreSQL/JDBC exception scan passed.\n\n'
+            printf 'The separate verify-release job downloads these actual release assets, checks SHA256SUMS,\n'
+            printf 'and repeats the complete Nacos verification using the downloaded JAR in a fresh database.\n'
+          } > release-assets/VERIFICATION.md
+          (cd release-assets && sha256sum "$ARTIFACT_NAME" "$SCHEMA_NAME" VERIFICATION.md > SHA256SUMS)
+          (cd release-assets && sha256sum --check --strict SHA256SUMS)
+
+      - name: Create or update the requested GitHub Release
+        if: success()
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: tffinder/nacos-postgresql-datasource-plugin
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            # Retry after a partial publish: replace only this tag's named assets.
+            gh release upload "$RELEASE_TAG" \
+              --repo "$GH_REPO" \
+              --clobber \
+              release-assets/"$ARTIFACT_NAME" \
+              release-assets/"$SCHEMA_NAME" \
+              release-assets/SHA256SUMS \
+              release-assets/VERIFICATION.md
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GH_REPO" \
+              --target "${{ github.sha }}" \
+              --title "Nacos PostgreSQL datasource plugin $RELEASE_TAG" \
+              --notes-file release-assets/VERIFICATION.md \
+              release-assets/"$ARTIFACT_NAME" \
+              release-assets/"$SCHEMA_NAME" \
+              release-assets/SHA256SUMS \
+              release-assets/VERIFICATION.md
+          fi
+          gh release view "$RELEASE_TAG" --repo "$GH_REPO" \
+            --json url,tagName --jq '"Published release: \(.tagName) -> \(.url)"'
+
+      - name: Upload redacted failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-and-build-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            **/target/surefire-reports/*.txt
+            **/target/surefire-reports/*.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Collect redacted Nacos failure logs
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/failure-logs"
+          if [[ -d "$RUNNER_TEMP/nacos-built/nacos-server/nacos/logs" ]]; then
+            shopt -s nullglob globstar
+            for source in "$RUNNER_TEMP"/nacos-built/nacos-server/nacos/logs/**/*.log \
+                          "$RUNNER_TEMP"/nacos-built/nacos-server/nacos/logs/**/*.out; do
+              relative="${source#"$RUNNER_TEMP/nacos-built/nacos-server/nacos/logs/"}"
+              destination="$RUNNER_TEMP/failure-logs/${relative//\//_}"
+              # Only selected .log/.out files enter this collection. Remove common
+              # credential/token forms; never collect application.properties,
+              # HTTP response bodies, command traces, or whole workspace archives.
+              sed -E \
+                -e 's/((access_?token|id_?token|refresh_?token|authorization|password|passwd|db\.password[^=[:space:]]*)[=:])[[:space:]]*[^[:space:],;&]+/\1[REDACTED]/Ig' \
+                -e 's/("?(access_?token|id_?token|refresh_?token|password|passwd|authorization|secret)"?[[:space:]]*:[[:space:]]*")[^"]+"/\1[REDACTED]"/Ig' \
+                -e 's/(Bearer )[A-Za-z0-9._~+\/-]+=*/\1[REDACTED]/g' \
+                "$source" > "$destination"
+            done
+          fi
+
+      - name: Upload redacted Nacos logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nacos-built-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/failure-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  verify-release:
+    name: Verify downloaded Release assets against a fresh database
+    needs: test-and-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: nacos-postgresql-verify-${{ needs.test-and-build.outputs.tag }}
+      cancel-in-progress: false
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nacos
+          POSTGRES_PASSWORD: nacos
+          POSTGRES_DB: nacos-release
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U nacos -d nacos-release"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+          --health-start-period=10s
+    steps:
+      - name: Check out verification script
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install JSON and PostgreSQL clients
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends jq postgresql-client
+
+      - name: View and download the just-published Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: tffinder/nacos-postgresql-datasource-plugin
+          RELEASE_TAG: ${{ needs.test-and-build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9A-Za-z._-]+$ ]]
+          mkdir -p "$RUNNER_TEMP/downloaded-release"
+          gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json assets,tagName,url \
+            --jq '"Release under test: \(.tagName) -> \(.url)"'
+          gh release download "$RELEASE_TAG" --repo "$GH_REPO" \
+            --dir "$RUNNER_TEMP/downloaded-release" \
+            --pattern "$ARTIFACT_NAME" \
+            --pattern "$SCHEMA_NAME" \
+            --pattern SHA256SUMS \
+            --pattern VERIFICATION.md
+          test -s "$RUNNER_TEMP/downloaded-release/$ARTIFACT_NAME"
+          test -s "$RUNNER_TEMP/downloaded-release/$SCHEMA_NAME"
+          test -s "$RUNNER_TEMP/downloaded-release/SHA256SUMS"
+          test -s "$RUNNER_TEMP/downloaded-release/VERIFICATION.md"
+
+      - name: Verify downloaded artifact checksums and package identity
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/downloaded-release"
+          sha256sum --check --strict SHA256SUMS
+          unzip -p "$ARTIFACT_NAME" META-INF/services/com.alibaba.nacos.plugin.datasource.mapper.Mapper \
+            | grep -Fx 'com.alibaba.nacos.plugin.datasource.impl.postgresql.HistoryConfigInfoMapperByPostgresql'
+          unzip -p "$ARTIFACT_NAME" META-INF/services/com.alibaba.nacos.plugin.datasource.dialect.DatabaseDialect \
+            | grep -Fx 'com.alibaba.nacos.plugin.datasource.dialect.PostgresqlDatabaseDialect'
+
+      - name: Initialize the fresh Release verification database
+        env:
+          PGPASSWORD: nacos
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -p 5432 -U nacos -d nacos-release -v ON_ERROR_STOP=1 \
+            --file "$RUNNER_TEMP/downloaded-release/$SCHEMA_NAME"
+
+      - name: Start Nacos with the downloaded plugin JAR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NACOS_DB_URL: jdbc:postgresql://127.0.0.1:5432/nacos-release
+          NACOS_DB_USER: nacos
+          NACOS_DB_PASSWORD: nacos
+          VERIFY_WORK_ROOT: ${{ runner.temp }}/nacos-release
+          VERIFY_ARTIFACT_START_ONLY: 'true'
+          NACOS_HOME: ${{ runner.temp }}/nacos-release/nacos-server/nacos
+        run: bash scripts/verify-artifact.sh "$RUNNER_TEMP/downloaded-release/$ARTIFACT_NAME"
+
+      - name: Repeat full Nacos verification using the downloaded Release JAR
+        env:
+          NACOS_HOME: ${{ runner.temp }}/nacos-release/nacos-server/nacos
+          VERIFY_TEST_ID: downloaded-release-${{ needs.test-and-build.outputs.tag }}
+          VERIFY_READY_TIMEOUT: '180'
+        run: bash scripts/verify-nacos.sh
+
+      - name: Stop Release verification Nacos instance
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f "$RUNNER_TEMP/nacos-release/nacos-server/nacos/bin/shutdown.sh" ]]; then
+            bash "$RUNNER_TEMP/nacos-release/nacos-server/nacos/bin/shutdown.sh" || true
+          fi
+
+      - name: Collect redacted Release verification failure logs
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-failure-logs"
+          if [[ -d "$RUNNER_TEMP/nacos-release/nacos-server/nacos/logs" ]]; then
+            shopt -s nullglob globstar
+            for source in "$RUNNER_TEMP"/nacos-release/nacos-server/nacos/logs/**/*.log \
+                          "$RUNNER_TEMP"/nacos-release/nacos-server/nacos/logs/**/*.out; do
+              relative="${source#"$RUNNER_TEMP/nacos-release/nacos-server/nacos/logs/"}"
+              destination="$RUNNER_TEMP/release-failure-logs/${relative//\//_}"
+              sed -E \
+                -e 's/((access_?token|id_?token|refresh_?token|authorization|password|passwd|db\.password[^=[:space:]]*)[=:])[[:space:]]*[^[:space:],;&]+/\1[REDACTED]/Ig' \
+                -e 's/("?(access_?token|id_?token|refresh_?token|password|passwd|authorization|secret)"?[[:space:]]*:[[:space:]]*")[^"]+"/\1[REDACTED]"/Ig' \
+                -e 's/(Bearer )[A-Za-z0-9._~+\/-]+=*/\1[REDACTED]/g' \
+                "$source" > "$destination"
+            done
+          fi
+
+      - name: Upload redacted Release verification logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nacos-release-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-failure-logs
+          if-no-files-found: ignore
+          retention-days: 7
