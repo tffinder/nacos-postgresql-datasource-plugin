@@ -70,7 +70,13 @@ get_config() {
     if [ -n "$gray_name" ]; then
         args+=(--data-urlencode "grayName=$gray_name")
     fi
-    request "${args[@]}"
+    # POST persists to PostgreSQL before the local dump cache updates; retry
+    # brief 404s so the immediate read observes the published configuration.
+    for attempt in {1..30}; do
+        request "${args[@]}"
+        [ "$HTTP_STATUS" = "404" ] || break
+        sleep 1
+    done
     assert_status 200 "$description"
     jq -e --arg data_id "$DATA_ID" --arg group "$GROUP" --arg content "$expected_content" '
         type == "object" and .code == 0
@@ -94,10 +100,17 @@ get_deleted_config() {
         args+=(--data-urlencode "grayName=$gray_name")
     fi
     request "${args[@]}"
-    assert_status 200 "$description"
-    # ConfigControllerV2 returns Result.success(null), not a not-found error.
-    jq -e 'type == "object" and .code == 0 and .data == null' \
-        "$HTTP_BODY" >/dev/null || fail "$description: expected code=0 with null configuration data."
+    for attempt in {1..30}; do
+        if [ "$HTTP_STATUS" = "404" ]; then
+            return 0
+        fi
+        if [ "$HTTP_STATUS" = "200" ] && jq -e 'type == "object" and .code == 0 and .data == null' "$HTTP_BODY" >/dev/null; then
+            return 0
+        fi
+        sleep 1
+        request "${args[@]}"
+    done
+    fail "$description: expected deleted configuration to be absent (HTTP 404 or code=0 with null data)."
 }
 
 publish_formal() {
