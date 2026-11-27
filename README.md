@@ -39,6 +39,7 @@ The upstream 2.5.x.1 source was not sufficient for a reproducible Nacos 2.5.5 in
    ```properties
    spring.sql.init.platform=postgresql
    db.num=1
+   db.pool.config.driverClassName=org.postgresql.Driver
    db.url.0=jdbc:postgresql://127.0.0.1:5432/nacos
    db.user.0=nacos
    db.password.0=replace-with-a-strong-password

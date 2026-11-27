@@ -66,6 +66,7 @@ printf '%s\n' \
     '# CI PostgreSQL datasource (configuration is not a failure-log artifact).' \
     'spring.sql.init.platform=postgresql' \
     'db.num=1' \
+    'db.pool.config.driverClassName=org.postgresql.Driver' \
     "db.url.0=$DB_URL" \
     "db.user.0=$DB_USER" \
     "db.password.0=$DB_PASSWORD" \
