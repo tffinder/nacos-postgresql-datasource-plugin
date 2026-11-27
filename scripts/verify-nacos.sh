@@ -194,8 +194,11 @@ assert_formal_history() {
             and ((.extInfo | fromjson).type == "properties")
             and ((.extInfo | fromjson).src_user == "ci-e2e")
         )
-    ' "$HTTP_BODY" >/dev/null || \
+    ' "$HTTP_BODY" >/dev/null || {
+        printf '[DEBUG] matching history rows: ' >&2
+        jq -c --arg data_id "$DATA_ID" '[.pageItems[] | select(.dataId == $data_id) | {dataId,group,tenant,content,opType,publishType,grayName,extInfo}]' "$HTTP_BODY" >&2 || true
         fail "History missing exactly one formal opType=$operation row with the expected content, empty grayName, and extInfo metadata."
+    }
 }
 
 assert_gray_history() {
