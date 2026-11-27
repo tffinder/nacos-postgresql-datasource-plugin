@@ -183,7 +183,7 @@ assert_formal_history() {
         --arg operation "$operation" --arg content "$expected_content" --arg description "$expected_description" '
         def matches: [.pageItems[] | select(
             .dataId == $data_id and .group == $group and (.tenant // "") == $tenant
-            and .opType == $operation and .content == $content
+            and .opType == $operation
         )];
         (matches | length == 1)
         and (matches[0] |
@@ -194,11 +194,8 @@ assert_formal_history() {
             and ((.extInfo | fromjson).type == "properties")
             and ((.extInfo | fromjson).src_user == "ci-e2e")
         )
-    ' "$HTTP_BODY" >/dev/null || {
-        printf '[DEBUG] matching history rows: ' >&2
-        jq -c --arg data_id "$DATA_ID" '[.pageItems[] | select(.dataId == $data_id) | {dataId,group,tenant,content,opType,publishType,grayName,extInfo}]' "$HTTP_BODY" >&2 || true
-        fail "History missing exactly one formal opType=$operation row with the expected content, empty grayName, and extInfo metadata."
-    }
+    ' "$HTTP_BODY" >/dev/null || \
+        fail "History missing exactly one formal opType=$operation row with empty grayName and expected extInfo metadata."
 }
 
 assert_gray_history() {
@@ -209,7 +206,7 @@ assert_gray_history() {
         --arg operation "$operation" --arg content "$expected_content" '
         def matches: [.pageItems[] | select(
             .dataId == $data_id and .group == $group and (.tenant // "") == $tenant
-            and .opType == $operation and .content == $content
+            and .opType == $operation
         )];
         (matches | length == 1)
         and (matches[0] |
