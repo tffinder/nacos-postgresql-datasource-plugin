@@ -117,7 +117,7 @@ jobs:
       - name: Verify built artifact through Nacos CRUD and history
         env:
           NACOS_HOME: ${{ runner.temp }}/nacos-built/nacos-server/nacos
-          VERIFY_TEST_ID: built-${{ steps.release.outputs.tag }}
+          VERIFY_TEST_ID: built-${{ steps.release.outputs.tag }}-${{ github.run_id }}
           VERIFY_READY_TIMEOUT: '180'
         run: bash scripts/verify-nacos.sh
 
@@ -322,7 +322,7 @@ jobs:
       - name: Repeat full Nacos verification using the downloaded Release JAR
         env:
           NACOS_HOME: ${{ runner.temp }}/nacos-release/nacos-server/nacos
-          VERIFY_TEST_ID: downloaded-release-${{ needs.test-and-build.outputs.tag }}
+          VERIFY_TEST_ID: downloaded-release-${{ needs.test-and-build.outputs.tag }}-${{ github.run_id }}
           VERIFY_READY_TIMEOUT: '180'
         run: bash scripts/verify-nacos.sh
 
